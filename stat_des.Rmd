@@ -1,0 +1,257 @@
+---
+title: "Statistiques descriptives"
+output: pdf_document
+date: "2024-05-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message=FALSE, warning=FALSE)
+require(survival)
+require(dplyr)
+require(ggplot2)
+require(survminer)
+set.seed(1234)
+```
+
+# Import
+
+```{r}
+qaly <- read.csv("graaphR_ensai.csv", 
+                 header = TRUE, 
+                 sep = ";", 
+                 encoding = "latin1", na.strings = c("", " ", "NA", "NI"))
+
+#Formattage en date
+qaly$death.dt <- as.Date(as.character(qaly$deathdt),format="%Y-%m-%d")
+qaly$rando.dt <- as.Date(as.character(qaly$randodt),format="%Y-%m-%d")
+qaly$max.dt <- as.Date(as.character(qaly$Datemax),format="%Y-%m-%d")
+qaly$rech.dt <- as.Date(as.character(qaly$relapsdt),format="%Y-%m-%d")
+
+
+
+# Délais
+qaly$suivi  <- as.numeric(qaly$max.dt-qaly$rando.dt)/ (365.25/12)
+qaly$survie <- as.numeric(qaly$death.dt-qaly$rando.dt)/ (365.25/12)
+qaly$delrech<- as.numeric(qaly$rech.dt-qaly$rando.dt)/ (365.25/12)
+qaly$delpfs<- qaly$suivi
+qaly$delpfs[!is.na(qaly$delrech)]<-qaly$delrech[!is.na(qaly$delrech)]
+
+```
+
+# Formattage de la base de données
+
+```{r format, echo=FALSE}
+# Conversion des types
+efs <- survfit(Surv(delpfs,pfs)~1, data=qaly)
+efs
+```
+
+# Kaplan Meier
+
+En observant la population, nous constatons qu'il existe un plateau de survie dans la queue droite de la courbe de survie. Cela signifie que certains patients ont survécu plus longtemps que les autres. 
+Cependant, même si nous observons ce plateau, nous ne pouvons pas dire qu'un modèle de guérison est approprié pour cette population.
+
+Note : Les courbes de survie sont toutes au dessus de 0.5 :
+$$
+P(T>t) \geq 0.5
+$$
+```{r}
+efs_p<-ggsurvplot(efs, data=qaly,
+           risk.table = TRUE,
+           ggtheme = theme_classic(),
+           conf.int = F)
+
+efs_p$plot+
+scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0),limits = c(0,1),breaks = seq(0,1,0.25))
+```
+
+En moyenne, les patients du traitement allégé survivent, de manière significative, moins longtemps que les patients du traitement intensif (9mois de plus, pvaleur=0.03)
+
+```{r}
+library(survRM2)
+# EFS RMST 
+# ARM 1 == bras allégé
+# ARM 0 == bras intensif
+rmst2(qaly$delpfs, qaly$pfs, as.factor(as.numeric(as.factor(qaly$R1))-1), covariates = NULL, alpha = 0.05)
+```
+
+
+En analysant le test de log rank, nous constatons que les deux groupes de patients n'ont pas le même taux de survie (pvalue = 0.03)
+
+```{r}
+survdiff(Surv(delpfs,pfs)~R1, data=qaly)
+```
+
+```{r}
+library(gtsummary)
+
+#delpfs en mois
+table1=
+  qaly %>%
+  select(R1, delpfs, pfs ) %>%
+  tbl_summary(by=R1,
+              type = list(delpfs ~ "continuous")
+  ) %>%
+  add_n() %>%
+  add_overall() %>%
+  add_p()
+
+table1
+```
+
+# Modèle de cox proportionnel
+
+```{r}
+cox_model<-coxph(Surv(delpfs,pfs)~R1, data=qaly)
+
+summary(cox_model)
+AIC(cox_model)
+BIC(cox_model)
+
+
+```
+
+Les patients du traitement allégé ont 1.9 fois plus de risque de décès ou de rechute que les patients avec l'ancien traitement intensif chimiothérapie (HR=1.9, IC95%=[1.1-3.3]).
+
+#### Hypothèse de proportionalité des risques
+
+Un modèle de Cox n’est valable que sous l’hypothèse de la proportionnalité des risques relatifs. Selon cette hypothèse les résidus ne dépendent pas du temps (H0).
+
+```{r}
+cox.zph(cox_model)
+```
+
+La pvaleur=0.85, donc on ne rejette pas H0. L'hypothèse de risque proportionnel est vérifiée.
+
+# Parametric survival model
+
+```{r}
+require(flexsurv)
+exp_model<-flexsurvreg(Surv(delpfs, pfs) ~ R1, data = qaly, dist = "exp")
+
+ggflexsurvplot(exp_model, data=qaly)
+AIC(exp_model)
+BIC(exp_model)
+```
+
+
+# Cure models with exponential distribution
+
+## Quasi-Newton Raphson algorithm
+
+### Mixture log likelihood implementation with no covariates (by hand)
+```{r }
+require(MASS)
+ll.mix <- function(par, time_v, cen_v, obj) {
+  # cat("Parameters: ", par, "\n")
+  pi_ <- par[1]
+
+  f_t <- do.call(obj$dfns$d, args = c(
+    as.list(par[2:length(par)]),
+    list(x = time_v, log = FALSE)
+  ))
+  
+  S_t <- do.call(obj$dfns$p, args = c(
+    as.list(par[2:length(par)]),
+    list(q = time_v, lower.tail = FALSE)
+  ))
+
+  f_ <- pi_ * f_t
+  s_ <- (1 - pi_) + pi_ * S_t
+  ret_val <- sum(cen_v * log(f_) + (1 - cen_v) * log(s_))
+  
+  # Return object
+  return(-ret_val)
+}
+
+```
+
+### Intensive arm (A) : Fitting the cure model
+
+```{r}
+fitA <- flexsurvreg(Surv(delpfs, pfs) ~ 1, data = qaly, dist = "exp",subset = R1=="Intensive arm (A)")
+
+fsr_useA <- fitA$res[, "est"]
+
+# Optimizing the cure model
+opt_obj_ <- try(optim(
+  par = c(0.6,fsr_useA), # dummy starting parameter for the cure fraction
+  fn = ll.mix,
+  time_v = qaly$delpfs[which(qaly$R1=="Intensive arm (A)")],
+  cen_v = qaly$pfs[which(qaly$R1=="Intensive arm (A)")],
+  method = "L-BFGS-B",
+  obj = fitA,
+  hessian = TRUE,
+  lower = c(0,rep(0.0001, length(fsr_useA))),
+  upper = c(1,rep(Inf, length(fsr_useA)))
+),silent = FALSE)
+```
+
+##### Formatting the results
+
+```{r, pb}
+N_m=1
+invHuse <- ginv(opt_obj_$hessian)
+est_cure <- data.frame(
+  uncured_rate = numeric(N_m),
+  cure_rate = numeric(N_m),
+  stderr = numeric(N_m),
+  # lower.ci = numeric(N_m),
+  # upper.ci = numeric(N_m), 
+  AIC = numeric(N_m),
+  BIC = numeric(N_m), stringsAsFactors = FALSE
+)
+est_cure$uncured_rate<- opt_obj_$par[1]
+est_cure$cure_rate<- 1 - opt_obj_$par[1]
+est_cure$stderr<- sqrt(invHuse[1,1])
+# est_cure$lower.ci<- est_cure$cure_rate- qt(0.975, fitA$N) * est_cure$stderr
+# est_cure$upper.ci<- est_cure$cure_rate + qt(0.975, fitA$N) * est_cure$stderr
+est_cure$AIC<- 2 * (length(fsr_useA) + 1) + 2 * opt_obj_$value
+est_cure$BIC<- (length(fsr_useA) + 1) *log(fitA$N) + 2 * opt_obj_$value
+
+print("Estimation cure rate")
+est_cure
+
+print("Paramètre loi exponentielle")
+opt_obj_$par[2]
+```
+
+#### Computing the survival function
+
+```{r}
+qalyA<-qaly[which(qaly$R1=="Intensive arm (A)"),]
+
+#Estimation of survival function for uncured
+qalyA$Su_<- do.call(fitA$dfns$p,args = c(as.list(opt_obj_$par[2]),
+                          list(q = qalyA$delpfs, lower.tail = FALSE)))
+#Estimation of overall survival function
+
+qalyA$St_<-(1-est_cure$uncured_rate)+est_cure$uncured_rate*qalyA$Su_
+
+efsA <- survfit(Surv(delpfs,pfs)~1, data=qaly,subset = R1=="Intensive arm (A)")
+
+ggplot() +
+  geom_line(data = qalyA, aes(x = delpfs, y = St_), color = "blue", size = 0.75) +
+  geom_step(aes(x = efsA$time, y = efsA$surv), color = "red", size = 0.75) +
+  labs(x = "Time (years)", y = "Survival function", title = "Survival function") +
+  ylim(0, 1) +
+  theme_classic()+
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0),limits = c(0,1),breaks = seq(0,1,0.25))
+```
+
+
+### Mixture cure model with function
+
+```{r}
+library(flexsurvcure)
+cure_model <- flexsurvcure(Surv(delpfs, pfs)~1, data=qaly, dist="exp", mixture=T,subset = R1=="Intensive arm (A)")
+print(cure_model)
+plot(cure_model)
+```
+
+
+
+
+
